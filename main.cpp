@@ -2,6 +2,7 @@
 #include <iostream>
 #include <chrono>
 #include <atomic>
+#include <mutex>
 #include "Config.h"
 #include "Detector.h"
 #include "Tracker.h"
@@ -9,22 +10,26 @@
 #include "ThreadedCamera.h"
 
 // ============================================
-// Global mouse click data
-// Shared between mouse callback
-// and main loop
+// Mouse drawing state
+// Handles draw ROI while video plays
 // ============================================
-struct MouseData
+struct MouseDrawData
 {
-    std::atomic<bool> bClicked{ false };
-    cv::Point         ClickPoint{ 0, 0 };
+    std::atomic<bool> bDrawing{ false };
+    std::atomic<bool> bROIReady{ false };
+    cv::Point         StartPoint{ 0, 0 };
+    cv::Point         EndPoint{ 0, 0 };
+    cv::Rect          DrawnROI;
     std::mutex        Mutex;
 };
 
-MouseData GMouse;
+MouseDrawData GMouse;
 
 // ============================================
-// Mouse callback — called when user
-// clicks on the video window
+// Mouse callback
+// Left press → start drawing
+// Left drag → update rectangle
+// Left release → ROI ready!
 // ============================================
 void OnMouse(
     int Event,
@@ -32,18 +37,83 @@ void OnMouse(
     int Flags,
     void* UserData)
 {
-    // Only handle left button click
+    // Clamp to valid range
+    X = std::max(0, X);
+    Y = std::max(0, Y);
+
     if (Event ==
         cv::EVENT_LBUTTONDOWN)
     {
+        // Start drawing
         std::lock_guard<std::mutex>
             Lock(GMouse.Mutex);
-        GMouse.ClickPoint = cv::Point(X, Y);
-        GMouse.bClicked   = true;
+        GMouse.StartPoint =
+            cv::Point(X, Y);
+        GMouse.EndPoint =
+            cv::Point(X, Y);
+        GMouse.bDrawing  = true;
+        GMouse.bROIReady = false;
 
         std::cout
-            << "Clicked at: ("
-            << X << ", " << Y << ")\n";
+            << "Drawing ROI...\n";
+    }
+    else if (Event ==
+        cv::EVENT_MOUSEMOVE &&
+        GMouse.bDrawing.load())
+    {
+        // Update end point while dragging
+        std::lock_guard<std::mutex>
+            Lock(GMouse.Mutex);
+        GMouse.EndPoint =
+            cv::Point(X, Y);
+    }
+    else if (Event ==
+        cv::EVENT_LBUTTONUP &&
+        GMouse.bDrawing.load())
+    {
+        // Finish drawing
+        std::lock_guard<std::mutex>
+            Lock(GMouse.Mutex);
+        GMouse.EndPoint =
+            cv::Point(X, Y);
+        GMouse.bDrawing  = false;
+
+        // Calculate ROI from
+        // start and end points
+        int RX = std::min(
+            GMouse.StartPoint.x,
+            GMouse.EndPoint.x);
+        int RY = std::min(
+            GMouse.StartPoint.y,
+            GMouse.EndPoint.y);
+        int RW = std::abs(
+            GMouse.EndPoint.x -
+            GMouse.StartPoint.x);
+        int RH = std::abs(
+            GMouse.EndPoint.y -
+            GMouse.StartPoint.y);
+
+        // Only accept if box
+        // is large enough
+        if (RW > 10 && RH > 10)
+        {
+            GMouse.DrawnROI =
+                cv::Rect(RX, RY, RW, RH);
+            GMouse.bROIReady = true;
+
+            std::cout
+                << "ROI drawn: "
+                << RW << "x" << RH
+                << " at ("
+                << RX << ","
+                << RY << ")\n";
+        }
+        else
+        {
+            std::cout
+                << "ROI too small!"
+                << " Draw bigger box.\n";
+        }
     }
 }
 
@@ -73,8 +143,7 @@ void DrawHUD(
     cv::Mat& Frame,
     double FPS,
     ETrackState State,
-    int Lost,
-    bool bWaitingForClick)
+    int Lost)
 {
     cv::rectangle(Frame,
         cv::Rect(0, 0, Frame.cols, 75),
@@ -89,37 +158,28 @@ void DrawHUD(
     std::string S;
     cv::Scalar  SC;
 
-    if (bWaitingForClick)
+    switch (State)
     {
-        S  = "CLICK ON OBJECT TO TRACK";
+    case ETrackState::Idle:
+        S  = "DRAW BOX ON OBJECT";
         SC = cv::Scalar(0, 255, 255);
-    }
-    else
-    {
-        switch (State)
-        {
-        case ETrackState::Idle:
-            S  = "IDLE - CLICK OBJECT";
-            SC = cv::Scalar(200, 200, 200);
-            break;
-        case ETrackState::Tracking:
-            S  = "TRACKING";
-            SC = cv::Scalar(0, 255, 0);
-            break;
-        case ETrackState::Occluded:
-            S  = "OCCLUDED [" +
-                std::to_string(Lost) +
-                "/" +
-                std::to_string(
-                    MAX_LOST_FRAMES)
-                + "]";
-            SC = cv::Scalar(0, 165, 255);
-            break;
-        case ETrackState::Lost:
-            S  = "SEARCHING...";
-            SC = cv::Scalar(0, 0, 255);
-            break;
-        }
+        break;
+    case ETrackState::Tracking:
+        S  = "TRACKING";
+        SC = cv::Scalar(0, 255, 0);
+        break;
+    case ETrackState::Occluded:
+        S  = "OCCLUDED [" +
+            std::to_string(Lost) +
+            "/" +
+            std::to_string(MAX_LOST_FRAMES)
+            + "]";
+        SC = cv::Scalar(0, 165, 255);
+        break;
+    case ETrackState::Lost:
+        S  = "SEARCHING...";
+        SC = cv::Scalar(0, 0, 255);
+        break;
     }
 
     cv::putText(Frame,
@@ -129,7 +189,7 @@ void DrawHUD(
         0.55, SC, 2);
 
     cv::putText(Frame,
-        "CLICK=Select  R=Reset  "
+        "DRAG=Draw ROI  R=Reset  "
         "1=CSRT 2=KCF  Q=Quit",
         cv::Point(10, 55),
         cv::FONT_HERSHEY_SIMPLEX,
@@ -137,22 +197,59 @@ void DrawHUD(
         cv::Scalar(180, 180, 180), 1);
 }
 
-// Draw crosshair at click point
-// while waiting for ROI
-void DrawCrosshair(
-    cv::Mat& Frame,
-    const cv::Point& Pt)
+// Draw live rectangle while dragging
+void DrawLiveROI(cv::Mat& Frame)
 {
-    cv::line(Frame,
-        cv::Point(Pt.x - 20, Pt.y),
-        cv::Point(Pt.x + 20, Pt.y),
+    if (!GMouse.bDrawing.load())
+        return;
+
+    std::lock_guard<std::mutex>
+        Lock(GMouse.Mutex);
+
+    cv::Point P1 = GMouse.StartPoint;
+    cv::Point P2 = GMouse.EndPoint;
+
+    // Draw animated rectangle
+    // while user is dragging
+    cv::rectangle(Frame,
+        P1, P2,
         cv::Scalar(0, 255, 255), 2);
+
+    // Draw corner markers
+    int CornerLen = 10;
+
+    // Top left corner
     cv::line(Frame,
-        cv::Point(Pt.x, Pt.y - 20),
-        cv::Point(Pt.x, Pt.y + 20),
-        cv::Scalar(0, 255, 255), 2);
-    cv::circle(Frame, Pt, 5,
-        cv::Scalar(0, 255, 255), -1);
+        P1,
+        cv::Point(P1.x + CornerLen, P1.y),
+        cv::Scalar(0, 255, 0), 3);
+    cv::line(Frame,
+        P1,
+        cv::Point(P1.x, P1.y + CornerLen),
+        cv::Scalar(0, 255, 0), 3);
+
+    // Bottom right corner
+    cv::line(Frame,
+        P2,
+        cv::Point(P2.x - CornerLen, P2.y),
+        cv::Scalar(0, 255, 0), 3);
+    cv::line(Frame,
+        P2,
+        cv::Point(P2.x, P2.y - CornerLen),
+        cv::Scalar(0, 255, 0), 3);
+
+    // Show size text
+    int W = std::abs(P2.x - P1.x);
+    int H = std::abs(P2.y - P1.y);
+    cv::putText(Frame,
+        std::to_string(W) + "x" +
+        std::to_string(H),
+        cv::Point(
+            std::min(P1.x, P2.x),
+            std::min(P1.y, P2.y) - 5),
+        cv::FONT_HERSHEY_SIMPLEX,
+        0.5,
+        cv::Scalar(0, 255, 255), 1);
 }
 
 int main()
@@ -160,9 +257,9 @@ int main()
     std::cout
         << "Object Tracker\n"
         << "==============\n"
-        << "CLICK on object to track!\n"
+        << "DRAG mouse to draw ROI!\n"
         << "R = Reset\n"
-        << "1 = CSRT (most accurate)\n"
+        << "1 = CSRT\n"
         << "2 = KCF\n"
         << "3 = CamShift\n"
         << "Q = Quit\n\n";
@@ -172,10 +269,11 @@ int main()
     // MODE 2 = Video file
     // MODE 3 = IP camera
     // ================================================
-    const int MODE = 1;
+    const int MODE = 2;
 
     const int CAMERA_INDEX = 0;
 
+    // !! CHANGE TO YOUR VIDEO PATH !!
     const std::string VIDEO_PATH =
         "C:/Users/Victus/Downloads/video.mp4";
 
@@ -228,8 +326,8 @@ int main()
     }
 
     cv::Mat Frame;
-    int  FrameCount  = 0;
-    bool bStabilize  = false;
+    int  FrameCount = 0;
+    bool bStabilize = false;
 
     // Create window
     cv::namedWindow(
@@ -238,16 +336,15 @@ int main()
     cv::resizeWindow(
         WINDOW_NAME, 960, 540);
 
-    // Set mouse callback on window
-    // This enables click to select!
+    // Set mouse callback
     cv::setMouseCallback(
         WINDOW_NAME,
         OnMouse, nullptr);
 
     std::cout
-        << "\nVideo is playing!\n"
-        << "CLICK on any object "
-        << "to start tracking it!\n\n";
+        << "\nVideo playing!\n"
+        << "DRAG mouse on object "
+        << "to draw ROI and track!\n\n";
 
     while (true)
     {
@@ -263,52 +360,32 @@ int main()
             PF = Stab.Stabilize(Frame);
 
         // ============================================
-        // CHECK FOR MOUSE CLICK
-        // Video keeps playing while
-        // checking for clicks!
+        // CHECK IF ROI WAS DRAWN
         // ============================================
-        if (GMouse.bClicked.load())
+        if (GMouse.bROIReady.load())
         {
-            cv::Point ClickPt;
+            cv::Rect DrawnROI;
             {
                 std::lock_guard<std::mutex>
                     Lock(GMouse.Mutex);
-                ClickPt = GMouse.ClickPoint;
-                GMouse.bClicked = false;
+                DrawnROI = GMouse.DrawnROI;
+                GMouse.bROIReady = false;
             }
 
-            std::cout
-                << "Auto detecting ROI "
-                << "around click point...\n";
+            // Clamp ROI to frame size
+            DrawnROI &= cv::Rect(0, 0,
+                PF.cols, PF.rows);
 
-            // Automatically create ROI
-            // around clicked object
-            // Video does NOT pause!
-            cv::Rect AutoROI =
-                Det.GetAutoROI(
-                    PF, ClickPt, 80);
-
-            if (AutoROI.area() > 100)
+            if (DrawnROI.area() > 100)
             {
                 // Initialize tracker
-                // with auto detected ROI
-                Tracker.Init(PF, AutoROI,
+                // with drawn ROI
+                Tracker.Init(PF,
+                    DrawnROI,
                     ETrackerType::CSRT);
 
                 std::cout
-                    << "Tracking started!\n"
-                    << "ROI: "
-                    << AutoROI.width
-                    << "x"
-                    << AutoROI.height
-                    << "\n";
-            }
-            else
-            {
-                std::cout
-                    << "Could not detect "
-                    << "object at click "
-                    << "point. Try again!\n";
+                    << "Tracking started!\n";
             }
         }
 
@@ -317,24 +394,27 @@ int main()
             ETrackState::Idle)
             Tracker.Update(PF);
 
-        // Draw tracking box
+        // Draw tracking result
         Tracker.Draw(PF);
+
+        // Draw live ROI rectangle
+        // while user is dragging
+        DrawLiveROI(PF);
 
         // Draw HUD
         DrawHUD(PF, FPS.Get(),
             Tracker.GetState(),
-            Tracker.GetLostCount(),
-            false);
+            Tracker.GetLostCount());
 
-        // Show click instruction
-        // when idle
+        // Show instruction when idle
         if (Tracker.GetState() ==
-            ETrackState::Idle)
+            ETrackState::Idle &&
+            !GMouse.bDrawing.load())
         {
             cv::putText(PF,
-                "CLICK on object to track",
+                "Drag mouse to select object",
                 cv::Point(
-                    PF.cols / 2 - 150,
+                    PF.cols / 2 - 180,
                     PF.rows / 2),
                 cv::FONT_HERSHEY_SIMPLEX,
                 0.8,
